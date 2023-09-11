@@ -330,10 +330,6 @@ impl LocalEndpointManager {
 
             // If local filter mode is set to ignore local set ignore_local Qos on writer
             if self.local_filter_mode == LocalFilterMode::IgnoreLocalQos {
-                println!(
-                    "Setting ignore local filter for {}:{}",
-                    topic_name, type_name
-                );
                 qos.ignore_local = Some(IgnoreLocal {
                     kind: IgnoreLocalKind::PARTICIPANT,
                 });
@@ -391,7 +387,6 @@ impl LocalEndpointManager {
             let t = create_topic(self.dp, &topic_name, &type_name, type_info, keyless);
 
             if self.local_filter_mode == LocalFilterMode::TopicFilter {
-                println!("Setting topic filter for {}:{}", topic_name, type_name);
                 let mode: dds_topic_filter_mode =
                     dds_topic_filter_mode_DDS_TOPIC_FILTER_SAMPLEINFO_ARG;
                 let function = dds_topic_filter_function_union {
@@ -752,7 +747,6 @@ unsafe extern "C" fn filter_local_writers(
         }
     };
 
-    println!("{}", result);
     result
 }
 

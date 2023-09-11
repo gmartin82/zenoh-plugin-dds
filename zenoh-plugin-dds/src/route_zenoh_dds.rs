@@ -457,7 +457,6 @@ unsafe fn prepare_iox_chunk(
     data: &ddsrt_iovec_t,
 ) -> Result<Option<*mut ::std::os::raw::c_void>, String> {
     if dds_is_shared_memory_available(data_writer) {
-        println!("Writer supports shared memory exchange!");
         let mut buffer: *mut ::std::os::raw::c_void = std::ptr::null_mut();
         // Don't include CDR header (size = 4 bytes)
         let size = data.iov_len - 4;
@@ -478,7 +477,6 @@ unsafe fn prepare_iox_chunk(
             )),
         }
     } else {
-        println!("Writer doesn't support shared memory exchange!");
         Ok(None)
     }
 }
