@@ -173,7 +173,7 @@ impl RouteDDSZenoh<'_> {
         let read_period = plugin.get_read_period(&ke);
 
         // create matching DDS reader that forwards data coming from zenoh
-        let dds_reader = plugin.local_endpoint_mgr.create_forwarding_reader(
+        let dds_reader = plugin.dds_endpoint_mgr.create_forwarding_reader(
             topic_name.clone(),
             topic_type.clone(),
             type_info,
@@ -193,7 +193,7 @@ impl RouteDDSZenoh<'_> {
             zenoh_publisher,
             remote_routed_readers: HashSet::new(),
             local_routed_writers: HashSet::new(),
-            local_endpoint_mgr: plugin.local_endpoint_mgr,
+            local_endpoint_mgr: plugin.dds_endpoint_mgr,
         })
     }
 

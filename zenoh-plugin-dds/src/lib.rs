@@ -261,7 +261,7 @@ pub async fn run(runtime: Runtime, config: Config) {
         routes_from_dds: HashMap::<OwnedKeyExpr, RouteDDSZenoh>::new(),
         routes_to_dds: HashMap::<OwnedKeyExpr, RouteZenohDDS>::new(),
         admin_space: HashMap::<OwnedKeyExpr, AdminRef>::new(),
-        local_endpoint_mgr: &dds_endpoint_mgr,
+        dds_endpoint_mgr: &dds_endpoint_mgr,
     };
 
     dds_plugin.run().await;
@@ -298,7 +298,7 @@ pub(crate) struct DdsPluginRuntime<'a> {
     // value is the JSon string to return to queries.
     admin_space: HashMap<OwnedKeyExpr, AdminRef>,
     // manages the creation / deletion of DDS data readers and writers
-    local_endpoint_mgr: &'a DDSEndpointManager,
+    dds_endpoint_mgr: &'a DDSEndpointManager,
 }
 
 impl Serialize for DdsPluginRuntime<'_> {

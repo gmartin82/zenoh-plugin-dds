@@ -309,7 +309,7 @@ impl DDSEndpointManager {
         DDSEndpointManager {
             dp,
             local_filter_mode,
-            // Instance handles of local writers for use by topic filter
+            // Tracks instance handles of local writers for use by topic filter
             local_writer_ihs: Arc::new(RwLock::new(HashSet::new())),
         }
     }
@@ -392,7 +392,6 @@ impl DDSEndpointManager {
                 let filter = dds_topic_filter {
                     mode,
                     f: function,
-                    // FIXME: Is this safe???
                     arg: Arc::as_ptr(&self.local_writer_ihs) as *mut c_void,
                 };
                 let _ret = dds_set_topic_filter_extended(t, &filter);
@@ -747,7 +746,6 @@ unsafe extern "C" fn filter_local_writers(
     result
 }
 
-// FIXME: Really need to track topics if using filters and delete when done with reader/writer
 unsafe fn create_topic(
     dp: dds_entity_t,
     topic_name: &str,

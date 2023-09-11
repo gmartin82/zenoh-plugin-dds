@@ -230,7 +230,7 @@ impl RouteZenohDDS<'_> {
             dds_writer,
             remote_routed_writers: HashSet::new(),
             local_routed_readers: HashSet::new(),
-            local_endpoint_mgr: plugin.local_endpoint_mgr,
+            local_endpoint_mgr: plugin.dds_endpoint_mgr,
         })
     }
 
