@@ -14,7 +14,7 @@
 
 use cyclors::{
     dds_entity_t, dds_get_entity_sertype, dds_strretcode, dds_writecdr, ddsi_serdata_from_ser_iov,
-    ddsi_serdata_kind_SDK_DATA, ddsi_sertype, ddsrt_iov_len_t, ddsrt_iovec_t,
+    ddsi_serdata_kind_SDK_DATA, ddsi_sertype, ddsrt_iovec_t,
 };
 #[cfg(feature = "dds_shm")]
 use cyclors::{
@@ -23,7 +23,6 @@ use cyclors::{
 };
 use serde::{Serialize, Serializer};
 use std::collections::HashSet;
-use std::convert::TryInto;
 #[cfg(feature = "dds_shm")]
 use std::ptr;
 use std::sync::atomic::Ordering;
@@ -392,23 +391,22 @@ fn do_route_data(s: Sample, topic_name: &str, data_writer: dds_entity_t) {
         // that is not necessarily safe or guaranteed to be leak free.
         // TODO replace when stable https://github.com/rust-lang/rust/issues/65816
         let (ptr, len, capacity) = vec_into_raw_parts(bs);
-        let size: ddsrt_iov_len_t = match len.try_into() {
-            Ok(s) => s,
-            Err(_) => {
-                log::warn!(
-                    "Route Zenoh->DDS ({} -> {}): can't route data; excessive payload size ({})",
-                    s.key_expr,
-                    topic_name,
-                    len
-                );
-                return;
-            }
-        };
 
-        let data_out = ddsrt_iovec_t {
-            iov_base: ptr as *mut std::ffi::c_void,
-            iov_len: size,
-        };
+        let data_out: ddsrt_iovec_t;
+        #[cfg(not(target_os = "windows"))]
+        {
+            data_out = ddsrt_iovec_t {
+                iov_base: ptr as *mut std::ffi::c_void,
+                iov_len: len,
+            };
+        }
+        #[cfg(target_os = "windows")]
+        {
+            data_out = ddsrt_iovec_t {
+                iov_base: ptr as *mut std::ffi::c_void,
+                iov_len: len as u32,
+            };
+        }
 
         let mut sertype_ptr: *const ddsi_sertype = std::ptr::null_mut();
         let ret = dds_get_entity_sertype(data_writer, &mut sertype_ptr);
@@ -424,23 +422,17 @@ fn do_route_data(s: Sample, topic_name: &str, data_writer: dds_entity_t) {
             return;
         }
 
-        let fwdp = ddsi_serdata_from_ser_iov(
-            sertype_ptr,
-            ddsi_serdata_kind_SDK_DATA,
-            1,
-            &data_out,
-            size as usize,
-        );
+        let fwdp =
+            ddsi_serdata_from_ser_iov(sertype_ptr, ddsi_serdata_kind_SDK_DATA, 1, &data_out, len);
 
         #[cfg(feature = "dds_shm")]
         {
             match prepare_iox_chunk(data_writer, &data_out) {
-                Ok(iox_chunk) => match iox_chunk {
-                    Some(iox_chunk) => {
+                Ok(iox_chunk) => {
+                    if let Some(iox_chunk) = iox_chunk {
                         (*fwdp).iox_chunk = iox_chunk;
                     }
-                    _ => (),
-                },
+                }
                 Err(e) => {
                     // Skip writing (via dds_writecdr) if an error occurs as Cyclone DDS asserts that a shared memory chunk is provided for writers with shared memory enabled.
                     log::warn!(
@@ -473,7 +465,7 @@ unsafe fn prepare_iox_chunk(
             0 => {
                 // Don't copy the CDR header
                 let ptr = data.iov_base.offset(4);
-                ptr::copy(ptr, buffer, size as usize);
+                ptr::copy(ptr, buffer, size);
                 shm_set_data_state(
                     buffer,
                     iox_shm_data_state_t_IOX_CHUNK_CONTAINS_SERIALIZED_DATA,
