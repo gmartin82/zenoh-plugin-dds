@@ -298,18 +298,15 @@ pub(crate) enum LocalFilterMode {
     TopicFilter,
 }
 
-pub(crate) struct LocalEndpointManager {
+pub(crate) struct DDSEndpointManager {
     dp: dds_entity_t,
     local_filter_mode: LocalFilterMode,
     local_writer_ihs: Arc<RwLock<HashSet<dds_instance_handle_t>>>,
 }
 
-impl LocalEndpointManager {
-    pub(crate) fn new(
-        dp: dds_entity_t,
-        local_filter_mode: LocalFilterMode,
-    ) -> LocalEndpointManager {
-        LocalEndpointManager {
+impl DDSEndpointManager {
+    pub(crate) fn new(dp: dds_entity_t, local_filter_mode: LocalFilterMode) -> DDSEndpointManager {
+        DDSEndpointManager {
             dp,
             local_filter_mode,
             // Instance handles of local writers for use by topic filter

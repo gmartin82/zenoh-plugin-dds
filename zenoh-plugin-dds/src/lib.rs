@@ -247,7 +247,7 @@ pub async fn run(runtime: Runtime, config: Config) {
         get_guid(&dp).unwrap()
     );
 
-    let dds_endpoint_mgr = LocalEndpointManager::new(dp, local_filter_mode);
+    let dds_endpoint_mgr = DDSEndpointManager::new(dp, local_filter_mode);
 
     let mut dds_plugin = DdsPluginRuntime {
         config,
@@ -298,7 +298,7 @@ pub(crate) struct DdsPluginRuntime<'a> {
     // value is the JSon string to return to queries.
     admin_space: HashMap<OwnedKeyExpr, AdminRef>,
     // manages the creation / deletion of DDS data readers and writers
-    local_endpoint_mgr: &'a LocalEndpointManager,
+    local_endpoint_mgr: &'a DDSEndpointManager,
 }
 
 impl Serialize for DdsPluginRuntime<'_> {

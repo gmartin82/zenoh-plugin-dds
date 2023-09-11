@@ -58,7 +58,7 @@ pub(crate) struct RouteDDSZenoh<'a> {
     local_routed_writers: HashSet<String>,
     // manages the creation / deletion of DDS data readers and writers
     #[serde(skip)]
-    local_endpoint_mgr: &'a LocalEndpointManager,
+    local_endpoint_mgr: &'a DDSEndpointManager,
 }
 
 impl Drop for RouteDDSZenoh<'_> {

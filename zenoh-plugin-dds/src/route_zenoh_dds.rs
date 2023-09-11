@@ -85,7 +85,7 @@ pub(crate) struct RouteZenohDDS<'a> {
     local_routed_readers: HashSet<String>,
     // manages the creation / deletion of DDS data readers and writers
     #[serde(skip)]
-    local_endpoint_mgr: &'a LocalEndpointManager,
+    local_endpoint_mgr: &'a DDSEndpointManager,
 }
 
 impl Drop for RouteZenohDDS<'_> {
@@ -459,7 +459,15 @@ unsafe fn prepare_iox_chunk(
     if dds_is_shared_memory_available(data_writer) {
         let mut buffer: *mut ::std::os::raw::c_void = std::ptr::null_mut();
         // Don't include CDR header (size = 4 bytes)
-        let size = data.iov_len - 4;
+        let size;
+        #[cfg(not(target_os = "windows"))]
+        {
+            size = data.iov_len - 4;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            size = data.iov_len as usize - 4;
+        }
         match dds_loan_shared_memory_buffer(data_writer, size, &mut buffer) {
             0 => {
                 // Don't copy the CDR header
