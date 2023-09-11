@@ -13,8 +13,8 @@
 //
 use async_trait::async_trait;
 use cyclors::qos::{
-    DurabilityService, History, IgnoreLocal, IgnoreLocalKind, Qos, Reliability, ReliabilityKind,
-    DDS_100MS_DURATION, DDS_1S_DURATION,
+    DurabilityService, History, Qos, Reliability, ReliabilityKind, DDS_100MS_DURATION,
+    DDS_1S_DURATION,
 };
 use cyclors::*;
 use flume::{unbounded, Receiver, Sender};
@@ -205,6 +205,7 @@ pub async fn run(runtime: Runtime, config: Config) {
             ),
         );
     }
+    let local_filter_mode: LocalFilterMode;
 
     // if "enable_shm" is set, configure CycloneDDS to use Iceoryx shared memory
     #[cfg(feature = "dds_shm")]
@@ -221,7 +222,16 @@ pub async fn run(runtime: Runtime, config: Config) {
             if config.forward_discovery {
                 warn!("DDS shared memory support enabled but will not be used as forward discovery mode is active.");
             }
+
+            // When DDS shared memory is enabled the ignore local Qos can't be used
+            local_filter_mode = LocalFilterMode::TopicFilter;
+        } else {
+            local_filter_mode = LocalFilterMode::IgnoreLocalQos;
         }
+    }
+    #[cfg(not(feature = "dds_shm"))]
+    {
+        local_filter_mode = LocalFilterMode::IgnoreLocalQos;
     }
 
     // create DDS Participant
@@ -237,6 +247,8 @@ pub async fn run(runtime: Runtime, config: Config) {
         get_guid(&dp).unwrap()
     );
 
+    let dds_endpoint_mgr = LocalEndpointManager::new(dp, local_filter_mode);
+
     let mut dds_plugin = DdsPluginRuntime {
         config,
         zsession: &zsession,
@@ -249,6 +261,7 @@ pub async fn run(runtime: Runtime, config: Config) {
         routes_from_dds: HashMap::<OwnedKeyExpr, RouteDDSZenoh>::new(),
         routes_to_dds: HashMap::<OwnedKeyExpr, RouteZenohDDS>::new(),
         admin_space: HashMap::<OwnedKeyExpr, AdminRef>::new(),
+        local_endpoint_mgr: &dds_endpoint_mgr,
     };
 
     dds_plugin.run().await;
@@ -284,6 +297,8 @@ pub(crate) struct DdsPluginRuntime<'a> {
     // admin space: index is the admin_keyexpr (relative to admin_prefix)
     // value is the JSon string to return to queries.
     admin_space: HashMap<OwnedKeyExpr, AdminRef>,
+    // manages the creation / deletion of DDS data readers and writers
+    local_endpoint_mgr: &'a LocalEndpointManager,
 }
 
 impl Serialize for DdsPluginRuntime<'_> {
@@ -512,11 +527,13 @@ impl<'a> DdsPluginRuntime<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn try_add_route_to_dds(
         &mut self,
         ke: OwnedKeyExpr,
         topic_name: &str,
         topic_type: &str,
+        type_info: &Option<TypeInfo>,
         keyless: bool,
         is_transient: bool,
         writer_qos: Option<Qos>,
@@ -539,7 +556,7 @@ impl<'a> DdsPluginRuntime<'a> {
             //       (just to declare the Zenoh Subscriber). Thus, try to set a DDS Writer to the route here.
             //       If already set, nothing will happen.
             if let Some(qos) = writer_qos {
-                if let Err(e) = route.set_dds_writer(self.dp, qos) {
+                if let Err(e) = route.set_dds_writer(qos) {
                     error!(
                         "{}: failed to set a DDS Writer after creation: {}",
                         route, e
@@ -557,6 +574,7 @@ impl<'a> DdsPluginRuntime<'a> {
             is_transient,
             topic_name.into(),
             topic_type.into(),
+            type_info.clone(),
             keyless,
         )
         .await
@@ -564,7 +582,7 @@ impl<'a> DdsPluginRuntime<'a> {
             Ok(route) => {
                 // if writer_qos is set, add a DDS Writer to the route
                 if let Some(qos) = writer_qos {
-                    if let Err(e) = route.set_dds_writer(self.dp, qos) {
+                    if let Err(e) = route.set_dds_writer(qos) {
                         error!(
                             "Route Zenoh->DDS ({} -> {}): creation failed: {}",
                             ke, topic_name, e
@@ -836,7 +854,7 @@ impl<'a> DdsPluginRuntime<'a> {
                             // create 1 route per partition, or just 1 if no partition
                             if partition_is_empty(&entity.qos.partition) {
                                 let ke = self.topic_to_keyexpr(&entity.topic_name, &self.config.scope, None).unwrap();
-                                let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, entity.keyless, is_transient_local(&qos), Some(qos)).await;
+                                let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, &entity.type_info, entity.keyless, is_transient_local(&qos), Some(qos)).await;
                                 if let RouteStatus::Routed(ref route_key) = route_status {
                                     if let Some(r) = self.routes_to_dds.get_mut(route_key) {
                                         // if route has been created, add this Reader in its routed_readers list
@@ -847,7 +865,7 @@ impl<'a> DdsPluginRuntime<'a> {
                             } else {
                                 for p in entity.qos.partition.as_deref().unwrap() {
                                     let ke = self.topic_to_keyexpr(&entity.topic_name, &self.config.scope, Some(p)).unwrap();
-                                    let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, entity.keyless, is_transient_local(&qos), Some(qos.clone())).await;
+                                    let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, &entity.type_info, entity.keyless, is_transient_local(&qos), Some(qos.clone())).await;
                                     if let RouteStatus::Routed(ref route_key) = route_status {
                                         if let Some(r) = self.routes_to_dds.get_mut(route_key) {
                                             // if route has been created, add this Reader in its routed_readers list
@@ -1071,7 +1089,7 @@ impl<'a> DdsPluginRuntime<'a> {
                             // create 1 route per partition, or just 1 if no partition
                             if partition_is_empty(&entity.qos.partition) {
                                 let ke = self.topic_to_keyexpr(&entity.topic_name, &self.config.scope, None).unwrap();
-                                let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, entity.keyless, is_transient_local(&entity.qos), None).await;
+                                let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, &entity.type_info, entity.keyless, is_transient_local(&entity.qos), None).await;
                                 if let RouteStatus::Routed(ref route_key) = route_status {
                                     if let Some(r) = self.routes_to_dds.get_mut(route_key) {
                                         // if route has been created, add this Reader in its routed_readers list
@@ -1082,7 +1100,7 @@ impl<'a> DdsPluginRuntime<'a> {
                             } else {
                                 for p in entity.qos.partition.as_deref().unwrap() {
                                     let ke = self.topic_to_keyexpr(&entity.topic_name, &self.config.scope, Some(p)).unwrap();
-                                    let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, entity.keyless, is_transient_local(&entity.qos), None).await;
+                                    let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, &entity.type_info, entity.keyless, is_transient_local(&entity.qos), None).await;
                                     if let RouteStatus::Routed(ref route_key) = route_status {
                                         if let Some(r) = self.routes_to_dds.get_mut(route_key) {
                                             // if route has been created, add this Reader in its routed_readers list
@@ -1186,7 +1204,7 @@ impl<'a> DdsPluginRuntime<'a> {
                                     // create 1 "to_dds" route per partition, or just 1 if no partition
                                     if partition_is_empty(&entity.qos.partition) {
                                         let ke = self.topic_to_keyexpr(&entity.topic_name, &scope, None).unwrap();
-                                        let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, entity.keyless, is_transient_local(&qos), Some(qos)).await;
+                                        let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, &entity.type_info, entity.keyless, is_transient_local(&qos), Some(qos)).await;
                                         if let RouteStatus::Routed(ref route_key) = route_status {
                                             if let Some(r) = self.routes_to_dds.get_mut(route_key) {
                                                 // add the writer's admin keyexpr to the list of remote_routed_writers
@@ -1203,7 +1221,7 @@ impl<'a> DdsPluginRuntime<'a> {
                                     } else {
                                         for p in entity.qos.partition.as_deref().unwrap() {
                                             let ke = self.topic_to_keyexpr(&entity.topic_name, &scope, Some(p)).unwrap();
-                                            let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, entity.keyless, is_transient_local(&qos), Some(qos.clone())).await;
+                                            let route_status = self.try_add_route_to_dds(ke, &entity.topic_name, &entity.type_name, &entity.type_info, entity.keyless, is_transient_local(&qos), Some(qos.clone())).await;
                                             if let RouteStatus::Routed(ref route_key) = route_status {
                                                 if let Some(r) = self.routes_to_dds.get_mut(route_key) {
                                                     // add the writer's admin keyexpr to the list of remote_routed_writers
@@ -1633,11 +1651,7 @@ fn adapt_writer_qos_for_proxy_writer(qos: &Qos) -> Qos {
     // Unset proprietary QoS which shouldn't apply
     writer_qos.properties = None;
     writer_qos.entity_name = None;
-
-    // Don't match with readers with the same participant
-    writer_qos.ignore_local = Some(IgnoreLocal {
-        kind: IgnoreLocalKind::PARTICIPANT,
-    });
+    writer_qos.ignore_local = None;
 
     writer_qos
 }
@@ -1652,10 +1666,8 @@ fn adapt_reader_qos_for_writer(qos: &Qos) -> Qos {
     writer_qos.properties = None;
     writer_qos.entity_name = None;
 
-    // Don't match with readers with the same participant
-    writer_qos.ignore_local = Some(IgnoreLocal {
-        kind: IgnoreLocalKind::PARTICIPANT,
-    });
+    // Unset proprietary QoS which shouldn't apply
+    writer_qos.ignore_local = None;
 
     // if Reader is TRANSIENT_LOCAL, configure durability_service QoS with same history as the Reader.
     // This is because CycloneDDS is actually using durability_service.history for transient_local historical data.

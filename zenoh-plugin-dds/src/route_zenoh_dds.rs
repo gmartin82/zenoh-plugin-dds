@@ -16,9 +16,16 @@ use cyclors::{
     dds_entity_t, dds_get_entity_sertype, dds_strretcode, dds_writecdr, ddsi_serdata_from_ser_iov,
     ddsi_serdata_kind_SDK_DATA, ddsi_sertype, ddsrt_iov_len_t, ddsrt_iovec_t,
 };
+#[cfg(feature = "dds_shm")]
+use cyclors::{
+    dds_is_shared_memory_available, dds_loan_shared_memory_buffer,
+    iox_shm_data_state_t_IOX_CHUNK_CONTAINS_SERIALIZED_DATA, shm_set_data_state,
+};
 use serde::{Serialize, Serializer};
 use std::collections::HashSet;
 use std::convert::TryInto;
+#[cfg(feature = "dds_shm")]
+use std::ptr;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::{ffi::CStr, fmt, sync::atomic::AtomicI32, time::Duration};
@@ -63,6 +70,9 @@ pub(crate) struct RouteZenohDDS<'a> {
     topic_name: String,
     // the DDS topic type
     topic_type: String,
+    // DDS type information if available
+    #[serde(skip)]
+    type_info: Option<TypeInfo>,
     // is DDS topic keyess
     keyless: bool,
     // the local DDS Writer created to serve the route (i.e. re-publish to DDS data coming from zenoh)
@@ -74,6 +84,9 @@ pub(crate) struct RouteZenohDDS<'a> {
     remote_routed_writers: HashSet<OwnedKeyExpr>,
     // the list of local readers served by this route (entity keys)
     local_routed_readers: HashSet<String>,
+    // manages the creation / deletion of DDS data readers and writers
+    #[serde(skip)]
+    local_endpoint_mgr: &'a LocalEndpointManager,
 }
 
 impl Drop for RouteZenohDDS<'_> {
@@ -110,6 +123,7 @@ impl RouteZenohDDS<'_> {
         querying_subscriber: bool,
         topic_name: String,
         topic_type: String,
+        type_info: Option<TypeInfo>,
         keyless: bool,
     ) -> Result<RouteZenohDDS<'a>, String> {
         log::debug!(
@@ -212,27 +226,25 @@ impl RouteZenohDDS<'_> {
             zenoh_subscriber,
             topic_name,
             topic_type,
+            type_info,
             keyless,
             dds_writer,
             remote_routed_writers: HashSet::new(),
             local_routed_readers: HashSet::new(),
+            local_endpoint_mgr: plugin.local_endpoint_mgr,
         })
     }
 
-    pub(crate) fn set_dds_writer(
-        &self,
-        data_participant: dds_entity_t,
-        writer_qos: Qos,
-    ) -> Result<(), String> {
+    pub(crate) fn set_dds_writer(&self, writer_qos: Qos) -> Result<(), String> {
         // check if dds_writer was already set
         let old = self.dds_writer.load(Ordering::SeqCst);
 
         if old == DDS_ENTITY_NULL {
             log::debug!("{}: create DDS Writer", self);
-            let dw = create_forwarding_dds_writer(
-                data_participant,
-                self.topic_name.clone(),
-                self.topic_type.clone(),
+            let dw = self.local_endpoint_mgr.create_forwarding_writer(
+                &self.topic_name,
+                &self.topic_type,
+                &self.type_info,
                 self.keyless,
                 writer_qos,
             )?;
@@ -247,7 +259,7 @@ impl RouteZenohDDS<'_> {
                     "{}: delete DDS Writer since another task created one concurrently",
                     self
                 );
-                if let Err(e) = delete_dds_entity(dw) {
+                if let Err(e) = self.local_endpoint_mgr.delete_writer(dw) {
                     log::warn!(
                         "{}: failed to delete DDS Writer created in concurrence of another task: {}",
                         self, e
@@ -263,7 +275,7 @@ impl RouteZenohDDS<'_> {
             .dds_writer
             .swap(DDS_ENTITY_NULL, std::sync::atomic::Ordering::Relaxed);
         if dds_entity != DDS_ENTITY_NULL {
-            if let Err(e) = delete_dds_entity(dds_entity) {
+            if let Err(e) = self.local_endpoint_mgr.delete_writer(dds_entity) {
                 log::warn!("{}: error deleting DDS Writer:  {}", self, e);
             }
         }
@@ -420,7 +432,61 @@ fn do_route_data(s: Sample, topic_name: &str, data_writer: dds_entity_t) {
             size as usize,
         );
 
+        #[cfg(feature = "dds_shm")]
+        {
+            match prepare_iox_chunk(data_writer, &data_out) {
+                Ok(iox_chunk) => match iox_chunk {
+                    Some(iox_chunk) => {
+                        (*fwdp).iox_chunk = iox_chunk;
+                    }
+                    _ => (),
+                },
+                Err(e) => {
+                    // Skip writing (via dds_writecdr) if an error occurs as Cyclone DDS asserts that a shared memory chunk is provided for writers with shared memory enabled.
+                    log::warn!(
+                        "Route Zenoh->DDS ({} -> {}): can't route data; {}",
+                        s.key_expr,
+                        topic_name,
+                        e
+                    );
+                    return;
+                }
+            }
+        }
+
         dds_writecdr(data_writer, fwdp);
         drop(Vec::from_raw_parts(ptr, len, capacity));
+    }
+}
+
+#[cfg(feature = "dds_shm")]
+unsafe fn prepare_iox_chunk(
+    data_writer: dds_entity_t,
+    data: &ddsrt_iovec_t,
+) -> Result<Option<*mut ::std::os::raw::c_void>, String> {
+    if dds_is_shared_memory_available(data_writer) {
+        println!("Writer supports shared memory exchange!");
+        let mut buffer: *mut ::std::os::raw::c_void = std::ptr::null_mut();
+        // Don't include CDR header (size = 4 bytes)
+        let size = data.iov_len - 4;
+        match dds_loan_shared_memory_buffer(data_writer, size, &mut buffer) {
+            0 => {
+                // Don't copy the CDR header
+                let ptr = data.iov_base.offset(4);
+                ptr::copy(ptr, buffer, size as usize);
+                shm_set_data_state(
+                    buffer,
+                    iox_shm_data_state_t_IOX_CHUNK_CONTAINS_SERIALIZED_DATA,
+                );
+                Ok(Some(buffer))
+            }
+            _ => Err(format!(
+                "Failed to loan shared memory buffer from DDS (size={})",
+                size
+            )),
+        }
+    } else {
+        println!("Writer doesn't support shared memory exchange!");
+        Ok(None)
     }
 }
