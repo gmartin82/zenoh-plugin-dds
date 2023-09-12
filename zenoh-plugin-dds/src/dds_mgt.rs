@@ -730,9 +730,6 @@ unsafe extern "C" fn filter_local_writers(
     sampleinfo: *const dds_sample_info_t,
     arg: *mut ::std::os::raw::c_void,
 ) -> bool {
-    // true = accept, false = reject
-    print!("In topic filter: accept=");
-
     let result = match (*(arg as *const RwLock<HashSet<u64>>)).read() {
         Ok(set) => {
             // Reject sample is it originated from a local writer
