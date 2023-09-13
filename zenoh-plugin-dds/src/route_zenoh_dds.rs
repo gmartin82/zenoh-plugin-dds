@@ -138,12 +138,17 @@ impl RouteZenohDDS<'_> {
         // Clone it for the subscriber_callback
         let arc_dw = dds_writer.clone();
 
+        #[cfg(feature = "dds_shm")]
+        let shm_enabled = plugin.config.shm_enabled;
+        #[cfg(not(feature = "dds_shm"))]
+        let shm_enabled = false;
+
         // Callback routing data received by Zenoh subscriber to DDS Writer (if set)
         let ton = topic_name.clone();
         let subscriber_callback = move |s: Sample| {
             let dw = arc_dw.load(Ordering::Relaxed);
             if dw != DDS_ENTITY_NULL {
-                do_route_data(s, &ton, dw);
+                do_route_data(s, &ton, dw, shm_enabled);
             } else {
                 // delay the routing of data for few ms in case this publication arrived
                 // before the discovery message provoking the creation of the Data Writer
@@ -160,7 +165,7 @@ impl RouteZenohDDS<'_> {
                         async_std::task::sleep(Duration::from_millis(100)).await;
                         let dw = arc_dw2.load(Ordering::Relaxed);
                         if dw != DDS_ENTITY_NULL {
-                            do_route_data(s, &ton2, dw);
+                            do_route_data(s, &ton2, dw, shm_enabled);
                             break;
                         } else {
                             log::warn!(
@@ -366,7 +371,7 @@ impl RouteZenohDDS<'_> {
     }
 }
 
-fn do_route_data(s: Sample, topic_name: &str, data_writer: dds_entity_t) {
+fn do_route_data(s: Sample, topic_name: &str, data_writer: dds_entity_t, _shm_enabled: bool) {
     if *LOG_PAYLOAD {
         log::trace!(
             "Route Zenoh->DDS ({} -> {}): routing data - payload: {:?}",
@@ -427,21 +432,23 @@ fn do_route_data(s: Sample, topic_name: &str, data_writer: dds_entity_t) {
 
         #[cfg(feature = "dds_shm")]
         {
-            match prepare_iox_chunk(data_writer, &data_out) {
-                Ok(iox_chunk) => {
-                    if let Some(iox_chunk) = iox_chunk {
-                        (*fwdp).iox_chunk = iox_chunk;
+            if _shm_enabled {
+                match prepare_iox_chunk(data_writer, &data_out) {
+                    Ok(iox_chunk) => {
+                        if let Some(iox_chunk) = iox_chunk {
+                            (*fwdp).iox_chunk = iox_chunk;
+                        }
                     }
-                }
-                Err(e) => {
-                    // Skip writing (via dds_writecdr) if an error occurs as Cyclone DDS asserts that a shared memory chunk is provided for writers with shared memory enabled.
-                    log::warn!(
-                        "Route Zenoh->DDS ({} -> {}): can't route data; {}",
-                        s.key_expr,
-                        topic_name,
-                        e
-                    );
-                    return;
+                    Err(e) => {
+                        // Skip writing (via dds_writecdr) if an error occurs as Cyclone DDS asserts that a shared memory chunk is provided for writers with shared memory enabled.
+                        log::warn!(
+                            "Route Zenoh->DDS ({} -> {}): can't route data; {}",
+                            s.key_expr,
+                            topic_name,
+                            e
+                        );
+                        return;
+                    }
                 }
             }
         }
