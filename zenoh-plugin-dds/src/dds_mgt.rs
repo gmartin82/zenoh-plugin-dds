@@ -21,7 +21,6 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::mem::MaybeUninit;
-use std::os::raw::{self, c_void};
 use std::slice;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -402,7 +401,7 @@ impl DDSEndpointManager {
                 let filter = dds_topic_filter {
                     mode,
                     f: function,
-                    arg: Arc::as_ptr(&self.local_writer_ihs) as *mut c_void,
+                    arg: Arc::as_ptr(&self.local_writer_ihs) as *mut std::os::raw::c_void,
                 };
                 let _ret = dds_set_topic_filter_extended(t, &filter);
             }
@@ -517,7 +516,7 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
 
     let n = dds_take(
         dr,
-        samples.as_mut_ptr() as *mut *mut raw::c_void,
+        samples.as_mut_ptr(),
         si.as_mut_ptr() as *mut dds_sample_info_t,
         MAX_SAMPLES,
         MAX_SAMPLES as u32,
@@ -647,11 +646,7 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
             }
         }
     }
-    dds_return_loan(
-        dr,
-        samples.as_mut_ptr() as *mut *mut raw::c_void,
-        MAX_SAMPLES as i32,
-    );
+    dds_return_loan(dr, samples.as_mut_ptr(), MAX_SAMPLES as i32);
     Box::into_raw(btx);
 }
 
