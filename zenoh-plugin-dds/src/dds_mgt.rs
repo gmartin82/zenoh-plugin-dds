@@ -323,7 +323,7 @@ impl DDSEndpointManager {
         mut qos: Qos,
     ) -> Result<dds_entity_t, String> {
         unsafe {
-            let t = create_topic(self.dp, topic_name, type_name, type_info, keyless);
+            let t = create_topic(self.dp, topic_name, type_name, type_info, keyless)?;
 
             // If local filter mode is set to ignore local set ignore_local Qos on writer
             if self.local_filter_mode == LocalFilterMode::IgnoreLocalQos {
@@ -386,7 +386,7 @@ impl DDSEndpointManager {
         congestion_ctrl: CongestionControl,
     ) -> Result<dds_entity_t, String> {
         unsafe {
-            let t = create_topic(self.dp, &topic_name, &type_name, type_info, keyless);
+            let t = create_topic(self.dp, &topic_name, &type_name, type_info, keyless)?;
 
             if self.local_filter_mode == LocalFilterMode::TopicFilter {
                 log::trace!(
@@ -753,21 +753,17 @@ unsafe extern "C" fn filter_local_writers(
     result
 }
 
-unsafe fn create_topic(
+fn create_topic(
     dp: dds_entity_t,
     topic_name: &str,
     type_name: &str,
     type_info: &Option<TypeInfo>,
     keyless: bool,
-) -> dds_entity_t {
-    let cton = CString::new(topic_name.to_owned()).unwrap().into_raw();
-    let ctyn = CString::new(type_name.to_owned()).unwrap().into_raw();
+) -> Result<dds_entity_t, String> {
+    unsafe {
+        let mut descriptor: *mut dds_topic_descriptor_t = std::ptr::null_mut();
 
-    match type_info {
-        None => cdds_create_blob_topic(dp, cton, ctyn, keyless),
-        Some(type_info) => {
-            let mut descriptor: *mut dds_topic_descriptor_t = std::ptr::null_mut();
-
+        if let Some(type_info) = type_info {
             let ret = dds_create_topic_descriptor(
                 dds_find_scope_DDS_FIND_SCOPE_GLOBAL,
                 dp,
@@ -775,13 +771,30 @@ unsafe fn create_topic(
                 500000000,
                 &mut descriptor,
             );
-            let mut topic: dds_entity_t = 0;
-            if ret == (DDS_RETCODE_OK as i32) {
-                topic = dds_create_topic(dp, descriptor, cton, std::ptr::null(), std::ptr::null());
-                assert!(topic >= 0);
-                dds_delete_topic_descriptor(descriptor);
+
+            if ret != 0 {
+                return Err(format!(
+                    "Error creating topic descriptor for type {} (retcode={})",
+                    type_name, ret
+                ));
             }
-            topic
+        }
+
+        let cton = CString::new(topic_name.to_owned()).unwrap().into_raw();
+        let ctyn = CString::new(type_name.to_owned()).unwrap().into_raw();
+
+        let topic = match descriptor.is_null() {
+            true => cdds_create_blob_topic(dp, cton, ctyn, keyless),
+            false => dds_create_topic(dp, descriptor, cton, std::ptr::null(), std::ptr::null()),
+        };
+
+        if topic >= 0 {
+            Ok(topic)
+        } else {
+            Err(format!(
+                "Error creating topic {} for type {} (retcode={})",
+                topic_name, type_name, topic
+            ))
         }
     }
 }

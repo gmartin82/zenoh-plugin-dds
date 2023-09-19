@@ -424,6 +424,7 @@ fn do_route_data(s: Sample, topic_name: &str, data_writer: dds_entity_t, _shm_en
                     .to_str()
                     .unwrap_or("unrecoverable DDS retcode")
             );
+            drop(Vec::from_raw_parts(ptr, len, capacity));
             return;
         }
 
@@ -447,6 +448,7 @@ fn do_route_data(s: Sample, topic_name: &str, data_writer: dds_entity_t, _shm_en
                             topic_name,
                             e
                         );
+                        drop(Vec::from_raw_parts(ptr, len, capacity));
                         return;
                     }
                 }
