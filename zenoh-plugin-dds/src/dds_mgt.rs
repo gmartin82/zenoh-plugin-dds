@@ -737,7 +737,7 @@ unsafe extern "C" fn filter_local_writers(
 ) -> bool {
     let result = match (*(arg as *const RwLock<HashSet<u64>>)).read() {
         Ok(set) => {
-            // Reject sample is it originated from a local writer
+            // Reject sample if it originated from a local writer
             !set.contains(&(*sampleinfo).publication_handle)
         }
         Err(e) => {
