@@ -56,11 +56,14 @@ pub(crate) struct RouteDDSZenoh<'a> {
     remote_routed_readers: HashSet<OwnedKeyExpr>,
     // the list of local readers served by this route (entity keys)
     local_routed_writers: HashSet<String>,
+    // manages the creation / deletion of DDS data readers and writers
+    #[serde(skip)]
+    local_endpoint_mgr: &'a DDSEndpointManager,
 }
 
 impl Drop for RouteDDSZenoh<'_> {
     fn drop(&mut self) {
-        if let Err(e) = delete_dds_entity(self.dds_reader) {
+        if let Err(e) = self.local_endpoint_mgr.delete_reader(self.dds_reader) {
             log::warn!("{}: error deleting DDS Reader:  {}", self, e);
         }
     }
@@ -83,7 +86,7 @@ impl RouteDDSZenoh<'_> {
         plugin: &DdsPluginRuntime<'a>,
         topic_name: String,
         topic_type: String,
-        type_info: &Option<TypeInfo>,
+        topic_descriptor: &Option<TopicDescriptor>,
         keyless: bool,
         reader_qos: Qos,
         ke: OwnedKeyExpr,
@@ -169,12 +172,11 @@ impl RouteDDSZenoh<'_> {
 
         let read_period = plugin.get_read_period(&ke);
 
-        // create matching DDS Writer that forwards data coming from zenoh
-        let dds_reader = create_forwarding_dds_reader(
-            plugin.dp,
+        // create matching DDS reader that forwards data coming from zenoh
+        let dds_reader = plugin.dds_endpoint_mgr.create_forwarding_reader(
             topic_name.clone(),
             topic_type.clone(),
-            type_info,
+            topic_descriptor,
             keyless,
             reader_qos,
             declared_ke,
@@ -191,6 +193,7 @@ impl RouteDDSZenoh<'_> {
             zenoh_publisher,
             remote_routed_readers: HashSet::new(),
             local_routed_writers: HashSet::new(),
+            local_endpoint_mgr: plugin.dds_endpoint_mgr,
         })
     }
 

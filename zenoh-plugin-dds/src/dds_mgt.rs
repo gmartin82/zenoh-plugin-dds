@@ -12,17 +12,18 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use async_std::task;
-use cyclors::qos::{History, HistoryKind, Qos};
+use cyclors::qos::{History, HistoryKind, IgnoreLocal, IgnoreLocalKind, Qos};
 use cyclors::*;
 use flume::Sender;
 use log::{debug, error, warn};
+use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize, Serializer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::slice;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 #[cfg(feature = "dds_shm")]
 use zenoh::buffers::{ZBuf, ZSlice};
@@ -64,6 +65,22 @@ impl Drop for TypeInfo {
 unsafe impl Send for TypeInfo {}
 unsafe impl Sync for TypeInfo {}
 
+#[derive(Debug)]
+pub(crate) struct TopicDescriptor {
+    ptr: *mut dds_topic_descriptor_t,
+}
+
+impl Drop for TopicDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            dds_delete_topic_descriptor(self.ptr);
+        }
+    }
+}
+
+unsafe impl Send for TopicDescriptor {}
+unsafe impl Sync for TopicDescriptor {}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct DdsEntity {
     pub(crate) key: String,
@@ -72,6 +89,9 @@ pub(crate) struct DdsEntity {
     pub(crate) type_name: String,
     #[serde(skip)]
     pub(crate) type_info: Option<TypeInfo>,
+    // Temporary: Serializing only (and option) causes bincode to fail to deserialize
+    #[serde(skip_deserializing)]
+    pub(crate) topic_descriptor: Arc<Option<TopicDescriptor>>,
     pub(crate) keyless: bool,
     pub(crate) qos: Qos,
     pub(crate) routes: HashMap<String, RouteStatus>, // map of routes statuses indexed by partition ("*" only if no partition)
@@ -281,6 +301,215 @@ impl From<DDSRawSample> for Value {
     }
 }
 
+#[derive(PartialEq)]
+pub(crate) enum LocalFilterMode {
+    IgnoreLocalQos,
+    TopicFilter,
+}
+
+pub(crate) struct DDSEndpointManager {
+    dp: dds_entity_t,
+    local_filter_mode: LocalFilterMode,
+    local_writer_ihs: Arc<RwLock<HashSet<dds_instance_handle_t>>>,
+}
+
+impl DDSEndpointManager {
+    pub(crate) fn new(dp: dds_entity_t, local_filter_mode: LocalFilterMode) -> DDSEndpointManager {
+        DDSEndpointManager {
+            dp,
+            local_filter_mode,
+            // Tracks instance handles of local writers for use by topic filter
+            local_writer_ihs: Arc::new(RwLock::new(HashSet::new())),
+        }
+    }
+
+    pub(crate) fn create_forwarding_writer(
+        &self,
+        topic_name: &str,
+        type_name: &str,
+        topic_descriptor: &Option<TopicDescriptor>,
+        keyless: bool,
+        mut qos: Qos,
+    ) -> Result<dds_entity_t, String> {
+        unsafe {
+            let t = create_topic(self.dp, topic_name, type_name, topic_descriptor, keyless)?;
+
+            // If local filter mode is set to ignore local set ignore_local Qos on writer
+            if self.local_filter_mode == LocalFilterMode::IgnoreLocalQos {
+                log::trace!(
+                    "Setting ignore local Qos on writer for {}:{}",
+                    topic_name,
+                    type_name
+                );
+                qos.ignore_local = Some(IgnoreLocal {
+                    kind: IgnoreLocalKind::PARTICIPANT,
+                });
+            }
+            let qos_native = qos.to_qos_native();
+            let writer: i32 = dds_create_writer(self.dp, t, qos_native, std::ptr::null_mut());
+            Qos::delete_qos_native(qos_native);
+            if writer >= 0 {
+                let mut ih: dds_instance_handle_t = 0;
+                dds_get_instance_handle(writer, &mut ih);
+                let mut writer_ihs = self.local_writer_ihs.write().unwrap();
+                writer_ihs.insert(ih);
+
+                Ok(writer)
+            } else {
+                Err(format!(
+                    "Error creating DDS Writer: {}",
+                    CStr::from_ptr(dds_strretcode(-writer))
+                        .to_str()
+                        .unwrap_or("unrecoverable DDS retcode")
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn delete_writer(&self, writer: dds_entity_t) -> Result<(), String> {
+        let mut writer_ihs = self.local_writer_ihs.write().unwrap();
+
+        let mut ih: dds_instance_handle_t = 0;
+        unsafe {
+            dds_get_instance_handle(writer, &mut ih);
+        }
+
+        let result = delete_dds_entity(writer);
+        if result.is_ok() {
+            writer_ihs.remove(&ih);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_forwarding_reader(
+        &self,
+        topic_name: String,
+        type_name: String,
+        topic_descriptor: &Option<TopicDescriptor>,
+        keyless: bool,
+        mut qos: Qos,
+        z_key: KeyExpr,
+        z: Arc<Session>,
+        read_period: Option<Duration>,
+        congestion_ctrl: CongestionControl,
+    ) -> Result<dds_entity_t, String> {
+        unsafe {
+            let t = create_topic(self.dp, &topic_name, &type_name, topic_descriptor, keyless)?;
+
+            if self.local_filter_mode == LocalFilterMode::TopicFilter {
+                log::trace!(
+                    "Setting filter on reader topic for {}:{}",
+                    topic_name,
+                    type_name
+                );
+                let mode: dds_topic_filter_mode =
+                    dds_topic_filter_mode_DDS_TOPIC_FILTER_SAMPLEINFO_ARG;
+                let function = dds_topic_filter_function_union {
+                    sampleinfo_arg: Some(filter_local_writers),
+                };
+                let filter = dds_topic_filter {
+                    mode,
+                    f: function,
+                    arg: Arc::as_ptr(&self.local_writer_ihs) as *mut std::os::raw::c_void,
+                };
+                let _ret = dds_set_topic_filter_extended(t, &filter);
+            }
+
+            match read_period {
+                None => {
+                    // Use a Listener to route data as soon as it arrives
+                    let arg = Box::new((topic_name, z_key, z, congestion_ctrl));
+                    let sub_listener =
+                        dds_create_listener(Box::into_raw(arg) as *mut std::os::raw::c_void);
+                    dds_lset_data_available(sub_listener, Some(data_forwarder_listener));
+                    let qos_native = qos.to_qos_native();
+                    let reader = dds_create_reader(self.dp, t, qos_native, sub_listener);
+                    Qos::delete_qos_native(qos_native);
+                    if reader >= 0 {
+                        let res =
+                            dds_reader_wait_for_historical_data(reader, qos::DDS_100MS_DURATION);
+                        if res < 0 {
+                            log::error!(
+                                "Error calling dds_reader_wait_for_historical_data(): {}",
+                                CStr::from_ptr(dds_strretcode(-res))
+                                    .to_str()
+                                    .unwrap_or("unrecoverable DDS retcode")
+                            );
+                        }
+                        Ok(reader)
+                    } else {
+                        Err(format!(
+                            "Error creating DDS Reader: {}",
+                            CStr::from_ptr(dds_strretcode(-reader))
+                                .to_str()
+                                .unwrap_or("unrecoverable DDS retcode")
+                        ))
+                    }
+                }
+                Some(period) => {
+                    // Use a periodic task that takes data to route from a Reader with KEEP_LAST 1
+                    qos.history = Some(History {
+                        kind: HistoryKind::KEEP_LAST,
+                        depth: 1,
+                    });
+                    let qos_native = qos.to_qos_native();
+                    let reader = dds_create_reader(self.dp, t, qos_native, std::ptr::null());
+                    let z_key = z_key.into_owned();
+                    task::spawn(async move {
+                        // loop while reader's instance handle remain the same
+                        // (if reader was deleted, its dds_entity_t value might have been
+                        // reused by a new entity... don't trust it! Only trust instance handle)
+                        let mut original_handle: dds_instance_handle_t = 0;
+                        dds_get_instance_handle(reader, &mut original_handle);
+                        let mut handle: dds_instance_handle_t = 0;
+                        while dds_get_instance_handle(reader, &mut handle) == DDS_RETCODE_OK as i32
+                        {
+                            if handle != original_handle {
+                                break;
+                            }
+
+                            async_std::task::sleep(period).await;
+                            let mut zp: *mut ddsi_serdata = std::ptr::null_mut();
+                            #[allow(clippy::uninit_assumed_init)]
+                            let mut si = MaybeUninit::<[dds_sample_info_t; 1]>::uninit();
+                            while dds_takecdr(
+                                reader,
+                                &mut zp,
+                                1,
+                                si.as_mut_ptr() as *mut dds_sample_info_t,
+                                DDS_ANY_STATE,
+                            ) > 0
+                            {
+                                let si = si.assume_init();
+                                if si[0].valid_data {
+                                    log::trace!(
+                                        "Route (periodic) data to zenoh resource with rid={}",
+                                        z_key
+                                    );
+
+                                    let raw_sample = DDSRawSample::create(zp);
+
+                                    let _ = z
+                                        .put(&z_key, raw_sample)
+                                        .congestion_control(congestion_ctrl)
+                                        .res_sync();
+                                }
+                                ddsi_serdata_unref(zp);
+                            }
+                        }
+                    });
+                    Ok(reader)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn delete_reader(&self, reader: dds_entity_t) -> Result<(), String> {
+        delete_dds_entity(reader)
+    }
+}
+
 unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
     let btx = Box::from_raw(arg as *mut (DiscoveryType, Sender<DiscoveryEvent>));
     let discovery_type = btx.0;
@@ -350,16 +579,20 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
                     let ret = dds_builtintopic_get_endpoint_type_info(sample, &mut type_info);
 
                     let type_info = match ret {
-                        0 => match type_info.is_null() {
-                            false => Some(TypeInfo::new(type_info)),
-                            true => {
-                                debug!("Type information not available for type {}", type_name);
-                                None
+                        0 => {
+                            match type_info.is_null() {
+                                false => Some(TypeInfo::new(type_info)),
+                                true => {
+                                    debug!("Type information not available for topic (name: {}, type: {})", topic_name, type_name);
+                                    None
+                                }
                             }
-                        },
+                        }
                         _ => {
                             warn!(
-                                "Failed to lookup type information({})",
+                                "Failed to lookup type information (name: {}, type: {}, error: {})",
+                                topic_name,
+                                type_name,
                                 CStr::from_ptr(dds_strretcode(ret))
                                     .to_str()
                                     .unwrap_or("unrecoverable DDS retcode")
@@ -368,7 +601,7 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
                         }
                     };
 
-                    // send a DiscoveryEvent
+                    // Send a DiscoveryEvent (Note topic_descriptor is not yet set as this can't be resolved within a listener callback)
                     let entity = DdsEntity {
                         key: key.clone(),
                         participant_key: participant_key.clone(),
@@ -376,6 +609,7 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
                         type_name: String::from(type_name),
                         keyless,
                         type_info,
+                        topic_descriptor: Arc::new(None),
                         qos: Qos::from_qos_native((*sample).qos),
                         routes: HashMap::<String, RouteStatus>::new(),
                     };
@@ -512,171 +746,53 @@ unsafe extern "C" fn data_forwarder_listener(dr: dds_entity_t, arg: *mut std::os
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn create_forwarding_dds_reader(
-    dp: dds_entity_t,
-    topic_name: String,
-    type_name: String,
-    type_info: &Option<TypeInfo>,
-    keyless: bool,
-    mut qos: Qos,
-    z_key: KeyExpr,
-    z: Arc<Session>,
-    read_period: Option<Duration>,
-    congestion_ctrl: CongestionControl,
-) -> Result<dds_entity_t, String> {
-    unsafe {
-        let t = create_topic(dp, &topic_name, &type_name, type_info, keyless);
-
-        match read_period {
-            None => {
-                // Use a Listener to route data as soon as it arrives
-                let arg = Box::new((topic_name, z_key, z, congestion_ctrl));
-                let sub_listener =
-                    dds_create_listener(Box::into_raw(arg) as *mut std::os::raw::c_void);
-                dds_lset_data_available(sub_listener, Some(data_forwarder_listener));
-                let qos_native = qos.to_qos_native();
-                let reader = dds_create_reader(dp, t, qos_native, sub_listener);
-                Qos::delete_qos_native(qos_native);
-                if reader >= 0 {
-                    let res = dds_reader_wait_for_historical_data(reader, qos::DDS_100MS_DURATION);
-                    if res < 0 {
-                        log::error!(
-                            "Error calling dds_reader_wait_for_historical_data(): {}",
-                            CStr::from_ptr(dds_strretcode(-res))
-                                .to_str()
-                                .unwrap_or("unrecoverable DDS retcode")
-                        );
-                    }
-                    Ok(reader)
-                } else {
-                    Err(format!(
-                        "Error creating DDS Reader: {}",
-                        CStr::from_ptr(dds_strretcode(-reader))
-                            .to_str()
-                            .unwrap_or("unrecoverable DDS retcode")
-                    ))
-                }
-            }
-            Some(period) => {
-                // Use a periodic task that takes data to route from a Reader with KEEP_LAST 1
-                qos.history = Some(History {
-                    kind: HistoryKind::KEEP_LAST,
-                    depth: 1,
-                });
-                let qos_native = qos.to_qos_native();
-                let reader = dds_create_reader(dp, t, qos_native, std::ptr::null());
-                let z_key = z_key.into_owned();
-                task::spawn(async move {
-                    // loop while reader's instance handle remain the same
-                    // (if reader was deleted, its dds_entity_t value might have been
-                    // reused by a new entity... don't trust it! Only trust instance handle)
-                    let mut original_handle: dds_instance_handle_t = 0;
-                    dds_get_instance_handle(reader, &mut original_handle);
-                    let mut handle: dds_instance_handle_t = 0;
-                    while dds_get_instance_handle(reader, &mut handle) == DDS_RETCODE_OK as i32 {
-                        if handle != original_handle {
-                            break;
-                        }
-
-                        async_std::task::sleep(period).await;
-                        let mut zp: *mut ddsi_serdata = std::ptr::null_mut();
-                        #[allow(clippy::uninit_assumed_init)]
-                        let mut si = MaybeUninit::<[dds_sample_info_t; 1]>::uninit();
-                        while dds_takecdr(
-                            reader,
-                            &mut zp,
-                            1,
-                            si.as_mut_ptr() as *mut dds_sample_info_t,
-                            DDS_ANY_STATE,
-                        ) > 0
-                        {
-                            let si = si.assume_init();
-                            if si[0].valid_data {
-                                log::trace!(
-                                    "Route (periodic) data to zenoh resource with rid={}",
-                                    z_key
-                                );
-
-                                let raw_sample = DDSRawSample::create(zp);
-
-                                let _ = z
-                                    .put(&z_key, raw_sample)
-                                    .congestion_control(congestion_ctrl)
-                                    .res_sync();
-                            }
-                            ddsi_serdata_unref(zp);
-                        }
-                    }
-                });
-                Ok(reader)
-            }
+unsafe extern "C" fn filter_local_writers(
+    sampleinfo: *const dds_sample_info_t,
+    arg: *mut ::std::os::raw::c_void,
+) -> bool {
+    let result = match (*(arg as *const RwLock<HashSet<u64>>)).read() {
+        Ok(set) => {
+            // Reject sample if it originated from a local writer
+            !set.contains(&(*sampleinfo).publication_handle)
         }
-    }
+        Err(e) => {
+            panic!("Critical failure in topic filter: {}", e);
+        }
+    };
+
+    result
 }
 
 unsafe fn create_topic(
     dp: dds_entity_t,
     topic_name: &str,
     type_name: &str,
-    type_info: &Option<TypeInfo>,
+    topic_descriptor: &Option<TopicDescriptor>,
     keyless: bool,
-) -> dds_entity_t {
-    let cton = CString::new(topic_name.to_owned()).unwrap().into_raw();
-    let ctyn = CString::new(type_name.to_owned()).unwrap().into_raw();
-
-    match type_info {
-        None => cdds_create_blob_topic(dp, cton, ctyn, keyless),
-        Some(type_info) => {
-            let mut descriptor: *mut dds_topic_descriptor_t = std::ptr::null_mut();
-
-            let ret = dds_create_topic_descriptor(
-                dds_find_scope_DDS_FIND_SCOPE_GLOBAL,
-                dp,
-                type_info.ptr,
-                500000000,
-                &mut descriptor,
-            );
-            let mut topic: dds_entity_t = 0;
-            if ret == (DDS_RETCODE_OK as i32) {
-                topic = dds_create_topic(dp, descriptor, cton, std::ptr::null(), std::ptr::null());
-                assert!(topic >= 0);
-                dds_delete_topic_descriptor(descriptor);
-            }
-            topic
-        }
-    }
-}
-
-pub fn create_forwarding_dds_writer(
-    dp: dds_entity_t,
-    topic_name: String,
-    type_name: String,
-    keyless: bool,
-    qos: Qos,
 ) -> Result<dds_entity_t, String> {
-    let cton = CString::new(topic_name).unwrap().into_raw();
-    let ctyn = CString::new(type_name).unwrap().into_raw();
-
     unsafe {
-        let t = cdds_create_blob_topic(dp, cton, ctyn, keyless);
-        let qos_native = qos.to_qos_native();
-        let writer: i32 = dds_create_writer(dp, t, qos_native, std::ptr::null_mut());
-        Qos::delete_qos_native(qos_native);
-        if writer >= 0 {
-            Ok(writer)
+        let cton = CString::new(topic_name.to_owned()).unwrap().into_raw();
+        let ctyn = CString::new(type_name.to_owned()).unwrap().into_raw();
+
+        let topic = match topic_descriptor {
+            None => cdds_create_blob_topic(dp, cton, ctyn, keyless),
+            Some(descriptor) => {
+                dds_create_topic(dp, descriptor.ptr, cton, std::ptr::null(), std::ptr::null())
+            }
+        };
+
+        if topic >= 0 {
+            Ok(topic)
         } else {
             Err(format!(
-                "Error creating DDS Writer: {}",
-                CStr::from_ptr(dds_strretcode(-writer))
-                    .to_str()
-                    .unwrap_or("unrecoverable DDS retcode")
+                "Error creating topic {} for type {} (retcode={})",
+                topic_name, type_name, topic
             ))
         }
     }
 }
 
-pub fn delete_dds_entity(entity: dds_entity_t) -> Result<(), String> {
+pub(crate) fn delete_dds_entity(entity: dds_entity_t) -> Result<(), String> {
     unsafe {
         let r = dds_delete(entity);
         match r {
@@ -686,7 +802,42 @@ pub fn delete_dds_entity(entity: dds_entity_t) -> Result<(), String> {
     }
 }
 
-pub fn get_guid(entity: &dds_entity_t) -> Result<String, String> {
+pub(crate) fn create_topic_descriptor(
+    dp: dds_entity_t,
+    type_info: &Option<TypeInfo>,
+    topic_name: &str,
+    type_name: &str,
+) -> Arc<Option<TopicDescriptor>> {
+    if let Some(type_info) = type_info {
+        unsafe {
+            let mut descriptor: *mut dds_topic_descriptor_t = std::ptr::null_mut();
+            let ret = dds_create_topic_descriptor(
+                dds_find_scope_DDS_FIND_SCOPE_GLOBAL,
+                dp,
+                type_info.ptr,
+                500000000,
+                &mut descriptor,
+            );
+            return match ret {
+                0 => Arc::new(Some(TopicDescriptor { ptr: descriptor })),
+                _ => {
+                    warn!(
+                        "Failed to create topic descriptor (name: {}, type: {}, error: {})",
+                        topic_name,
+                        type_name,
+                        CStr::from_ptr(dds_strretcode(ret))
+                            .to_str()
+                            .unwrap_or("unrecoverable DDS retcode")
+                    );
+                    Arc::new(None)
+                }
+            };
+        }
+    }
+    Arc::new(None)
+}
+
+pub(crate) fn get_guid(entity: &dds_entity_t) -> Result<String, String> {
     unsafe {
         let mut guid = dds_guid_t { v: [0; 16] };
         let r = dds_get_guid(*entity, &mut guid);
@@ -707,3 +858,149 @@ where
         Err(_) => s.serialize_str("UNKOWN_GUID"),
     }
 }
+
+impl Serialize for TopicDescriptor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        unsafe {
+            let mut state = serializer.serialize_struct("dds_topic_descriptor_t", 11)?;
+
+            state.serialize_field("m_size", &(*self.ptr).m_size)?;
+
+            state.serialize_field("m_align", &(*self.ptr).m_align)?;
+
+            state.serialize_field("m_flagset", &(*self.ptr).m_flagset)?;
+
+            let typename = CStr::from_ptr((*self.ptr).m_typename);
+            state.serialize_field("m_typename", typename)?;
+
+            let nkeys = (*self.ptr).m_nkeys;
+            let keys = slice::from_raw_parts((*self.ptr).m_keys, nkeys as usize);
+            state.serialize_field("m_keys", &TopicDescriptorKeyDescriptors(keys))?;
+
+            let nops = (*self.ptr).m_nops;
+            state.serialize_field("m_nops", &nops)?;
+
+            // Actual length of m_ops is cops (which is >= m_nops)
+            let cops =
+                dds_stream_countops((*self.ptr).m_ops, (*self.ptr).m_nkeys, (*self.ptr).m_keys);
+            let ops = slice::from_raw_parts((*self.ptr).m_ops, cops as usize);
+            state.serialize_field("m_ops", &ops)?;
+
+            let meta = CStr::from_ptr((*self.ptr).m_meta);
+            state.serialize_field("m_meta", meta)?;
+
+            state.serialize_field(
+                "type_information",
+                &TopicDescriptorTypeMetaSer((*self.ptr).type_information),
+            )?;
+
+            state.serialize_field(
+                "type_mapping",
+                &TopicDescriptorTypeMetaSer((*self.ptr).type_mapping),
+            )?;
+
+            state.serialize_field(
+                "restrict_data_representation",
+                &(*self.ptr).restrict_data_representation,
+            )?;
+
+            state.end()
+        }
+    }
+}
+
+/*impl<'de> Deserialize<'de> for TopicDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value: String = Deserialize::deserialize(deserializer)?;
+        println!("{}", value);
+        todo!()
+    }
+}*/
+
+struct TopicDescriptorKeyDescriptors<'a>(&'a [dds_key_descriptor_t]);
+
+impl Serialize for TopicDescriptorKeyDescriptors<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for element in self.0 {
+            seq.serialize_element(&TopicDescriptorKeyDescriptor(element))?;
+        }
+        seq.end()
+    }
+}
+
+struct TopicDescriptorKeyDescriptor<'a>(&'a dds_key_descriptor_t);
+
+impl Serialize for TopicDescriptorKeyDescriptor<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        unsafe {
+            let mut state = serializer.serialize_struct("dds_key_descriptor_t", 3)?;
+
+            let name = CStr::from_ptr(self.0.m_name);
+            state.serialize_field("m_name", name)?;
+
+            state.serialize_field("m_offset", &self.0.m_offset)?;
+
+            state.serialize_field("m_idx", &self.0.m_idx)?;
+
+            state.end()
+        }
+    }
+}
+
+struct TopicDescriptorTypeMetaSer(dds_type_meta_ser);
+
+impl Serialize for TopicDescriptorTypeMetaSer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let data = unsafe { slice::from_raw_parts(self.0.data, self.0.sz as usize) };
+        serializer.serialize_bytes(data)
+    }
+}
+
+/*
+fn deserialize_topic_descriptor<'de, D>(
+    deserializer: D,
+) -> Result<Arc<Option<TopicDescriptor>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    println!("In deserialize_topic_descriptor()");
+    let value = Deserialize::deserialize(deserializer)?;
+    println!("Out deserialize_topic_descriptor()");
+
+    Ok(Arc::new(None))
+
+    let strs: Vec<String> = Deserialize::deserialize(deserializer)?;
+    let mut result: Vec<(Regex, f32)> = Vec::with_capacity(strs.len());
+    for s in strs {
+        let i = s
+            .find('=')
+            .ok_or_else(|| de::Error::custom(format!("Invalid 'max_frequency': {s}")))?;
+        let regex = Regex::new(&s[0..i]).map_err(|e| {
+            de::Error::custom(format!("Invalid regex for 'max_frequency': '{s}': {e}"))
+        })?;
+        let frequency: f32 = s[i + 1..].parse().map_err(|e| {
+            de::Error::custom(format!(
+                "Invalid float value for 'max_frequency': '{s}': {e}"
+            ))
+        })?;
+        result.push((regex, frequency));
+    }
+    Ok(result)
+}
+*/
