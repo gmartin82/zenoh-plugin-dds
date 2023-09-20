@@ -912,17 +912,6 @@ impl Serialize for TopicDescriptor {
     }
 }
 
-/*impl<'de> Deserialize<'de> for TopicDescriptor {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value: String = Deserialize::deserialize(deserializer)?;
-        println!("{}", value);
-        todo!()
-    }
-}*/
-
 struct TopicDescriptorKeyDescriptors<'a>(&'a [dds_key_descriptor_t]);
 
 impl Serialize for TopicDescriptorKeyDescriptors<'_> {
@@ -971,36 +960,3 @@ impl Serialize for TopicDescriptorTypeMetaSer {
         serializer.serialize_bytes(data)
     }
 }
-
-/*
-fn deserialize_topic_descriptor<'de, D>(
-    deserializer: D,
-) -> Result<Arc<Option<TopicDescriptor>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    println!("In deserialize_topic_descriptor()");
-    let value = Deserialize::deserialize(deserializer)?;
-    println!("Out deserialize_topic_descriptor()");
-
-    Ok(Arc::new(None))
-
-    let strs: Vec<String> = Deserialize::deserialize(deserializer)?;
-    let mut result: Vec<(Regex, f32)> = Vec::with_capacity(strs.len());
-    for s in strs {
-        let i = s
-            .find('=')
-            .ok_or_else(|| de::Error::custom(format!("Invalid 'max_frequency': {s}")))?;
-        let regex = Regex::new(&s[0..i]).map_err(|e| {
-            de::Error::custom(format!("Invalid regex for 'max_frequency': '{s}': {e}"))
-        })?;
-        let frequency: f32 = s[i + 1..].parse().map_err(|e| {
-            de::Error::custom(format!(
-                "Invalid float value for 'max_frequency': '{s}': {e}"
-            ))
-        })?;
-        result.push((regex, frequency));
-    }
-    Ok(result)
-}
-*/
